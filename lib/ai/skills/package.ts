@@ -1,0 +1,392 @@
+/**
+ * Parser de pacote de skill instalável (.zip → objeto validado). Entrada é upload de
+ * terceiro (não confiável): todo erro é um erro de ENSINO em pt-br ({ ok:false, error }),
+ * nunca um throw. Frontmatter do SKILL.md é lido à mão (só as chaves conhecidas) em vez
+ * de com uma lib de YAML genérica — superfície de ataque menor para input não confiável.
+ */
+import { createHash } from 'node:crypto';
+import { unzipSync } from 'fflate';
+import { skillMatcherSchema, validateSkillBody, type SkillMatcher } from '../../agent-engine/agent/skills';
+
+export interface SkillManifestEntry {
+  path: string;
+  size: number;
+  sha256: string;
+  kind: 'reference' | 'asset';
+}
+
+export interface ParsedSkillPackage {
+  name: string;
+  description: string;
+  matcher: SkillMatcher;
+  body: string;
+  files: Array<{ path: string; bytes: Uint8Array; entry: SkillManifestEntry }>;
+}
+
+export type ParseSkillResult =
+  | { ok: true; pkg: ParsedSkillPackage }
+  | { ok: false; error: { code: string; message: string } };
+
+const MAX_FILES = 64;
+const MAX_TOTAL_BYTES = 5 * 1024 * 1024;
+const MAX_FILE_BYTES = 1 * 1024 * 1024;
+const ASSET_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'pdf', 'mp3', 'ogg', 'mp4']);
+
+/**
+ * Alfabeto que o STORAGE (terceiro) aceita em nome de arquivo. O pacote vira chave de objeto
+ * lá ({org}/{nome}/{versionId}/{caminho}), então o nome do arquivo do zip SAI daqui e entra
+ * num sistema de terceiro: quem manda na forma é o alfabeto deles, não o nosso.
+ * Fonte (documentada, seção "File name restrictions"): https://supabase.com/docs/guides/storage/uploads/file-limits
+ * — alfanumérico (A-Z a-z 0-9), pontuação (_ - . ' ,), especiais (! * & $ @ = ; : + ? ( )) e espaço.
+ * A página NÃO documenta teto de comprimento para o nome — por isso não há asserção de tamanho aqui.
+ */
+export const ALFABETO_DO_NOME_NO_STORAGE = /^[A-Za-z0-9_\-.,'!*&$@=;:+?()\s]+$/;
+
+/** Um segmento da chave só pode chegar ao Storage se couber no alfabeto de lá. */
+function segmentoCabeNoStorage(segmento: string): boolean {
+  return ALFABETO_DO_NOME_NO_STORAGE.test(segmento);
+}
+
+function fail(code: string, message: string): ParseSkillResult {
+  return { ok: false, error: { code, message } };
+}
+
+/** Caminho seguro: relativo, sem `..`, sem raiz absoluta, sem separador de Windows. */
+function isSafePath(p: string): boolean {
+  if (p === '' || p.startsWith('/') || p.includes('\\')) return false;
+  const segments = p.split('/');
+  return segments.every((s) => s !== '..' && s !== '');
+}
+
+function extensionOf(p: string): string {
+  const idx = p.lastIndexOf('.');
+  return idx === -1 ? '' : p.slice(idx + 1).toLowerCase();
+}
+
+/**
+ * Lê só as chaves conhecidas do frontmatter (name, description, matcher.any_keywords,
+ * matcher.probe_keywords, matcher.any_tags) — parser dedicado, não YAML genérico. Aceita a forma exata do
+ * frontmatter de skill: `chave: valor` na raiz, `matcher:` seguido de `  any_keywords: [a, b]`
+ * indentado por baixo.
+ *
+ * Duas formas do ecossistema que este parser aprendeu a ler (#4458): `description: |`
+ * (bloco multilinha — o texto vira UMA descrição, não o literal "|") e a AUSÊNCIA de
+ * `matcher` (skill publicada sem ativação por palavra). Chave desconhecida DENTRO do
+ * `matcher` não é ignorada: é devolvida em `chavesDeMatcherDesconhecidas` para virar erro
+ * de ensino — um typo (`any_tag`) não pode virar "skill sem matcher" em silêncio.
+ *
+ * Pela mesma razão, o mapa em linha (`matcher: { any_keywords: [frete] }`, YAML válido)
+ * não é lido: ele volta em `matcherEmLinha` para virar erro de ensino, em vez de importar
+ * como `{}` e nunca disparar. Linha em branco entre `matcher:` e as chaves é pulada.
+ */
+function parseFrontmatter(raw: string): {
+  name?: string;
+  description?: string;
+  matcher: Record<string, unknown>;
+  chavesDeMatcherDesconhecidas: string[];
+  matcherEmLinha: boolean;
+} {
+  const lines = raw.split('\n');
+  let name: string | undefined;
+  let description: string | undefined;
+  const matcher: Record<string, unknown> = {};
+  const chavesDeMatcherDesconhecidas: string[] = [];
+  let matcherEmLinha = false;
+
+  const parseInlineArray = (value: string): string[] => {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) return [];
+    const inner = trimmed.slice(1, -1).trim();
+    if (inner === '') return [];
+    return inner.split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, ''));
+  };
+
+  /** `|`, `>`, `|-`… — escalar de bloco: o valor são as linhas indentadas abaixo. */
+  const isBlockScalar = (value: string): boolean => /^[|>][+-]?$/.test(value.trim());
+
+  /** Junta as linhas indentadas de um escalar de bloco numa frase só. */
+  const readBlockScalar = (start: number): { text: string; next: number } => {
+    const parts: string[] = [];
+    let j = start;
+    while (j < lines.length) {
+      const sub = lines[j] ?? '';
+      if (sub.trim() === '') {
+        parts.push('');
+        j += 1;
+        continue;
+      }
+      if (!/^\s+\S/.test(sub)) break;
+      parts.push(sub.trim());
+      j += 1;
+    }
+    return { text: parts.join(' ').replace(/\s+/g, ' ').trim(), next: j };
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] ?? '';
+    if (/^name:/.test(line)) {
+      name = line.slice(line.indexOf(':') + 1).trim();
+    } else if (/^description:/.test(line)) {
+      const value = line.slice(line.indexOf(':') + 1).trim();
+      if (isBlockScalar(value)) {
+        const bloco = readBlockScalar(i + 1);
+        description = bloco.text;
+        i = bloco.next - 1;
+      } else {
+        description = value;
+      }
+    } else if (/^matcher:/.test(line)) {
+      const resto = line.slice(line.indexOf(':') + 1).trim();
+      if (resto !== '' && !resto.startsWith('#') && resto.replace(/\s/g, '') !== '{}') matcherEmLinha = true;
+      // varre as linhas indentadas abaixo de `matcher:`, pulando linha em branco
+      let j = i + 1;
+      while (j < lines.length) {
+        const sub = lines[j] ?? '';
+        if (sub.trim() === '') {
+          j += 1;
+          continue;
+        }
+        if (!/^\s+\S/.test(sub)) break;
+        const subTrimmed = sub.trim();
+        const m = /^any_keywords:\s*(.*)$/.exec(subTrimmed);
+        const p = /^probe_keywords:\s*(.*)$/.exec(subTrimmed);
+        const t = /^any_tags:\s*(.*)$/.exec(subTrimmed);
+        if (m) matcher.any_keywords = parseInlineArray(m[1] ?? '');
+        else if (p) matcher.probe_keywords = parseInlineArray(p[1] ?? '');
+        else if (t) matcher.any_tags = parseInlineArray(t[1] ?? '');
+        else {
+          const chave = /^([A-Za-z0-9_-]+):/.exec(subTrimmed);
+          if (chave?.[1] !== undefined && !chavesDeMatcherDesconhecidas.includes(chave[1])) {
+            chavesDeMatcherDesconhecidas.push(chave[1]);
+          }
+        }
+        j += 1;
+      }
+      i = j - 1;
+    }
+  }
+
+  return { name, description, matcher, chavesDeMatcherDesconhecidas, matcherEmLinha };
+}
+
+/**
+ * Erro de ensino do matcher, com o CAMPO no nome (#4458). Antes a mensagem era uma só
+ * ("precisa de any_keywords"), inclusive quando o problema era outro campo — quem
+ * escrevia `any_tags: [""]` lia sobre any_keywords e não achava o defeito.
+ */
+function mensagemDoMatcherInvalido(campo: string): string {
+  if (campo === 'any_keywords') {
+    return 'O "matcher" do SKILL.md tem "any_keywords" inválido — use uma lista com pelo menos 1 palavra (cada uma de 1 a 120 caracteres). Para uma skill SEM ativação por palavra, tire o matcher do frontmatter.';
+  }
+  if (campo === 'probe_keywords') {
+    return 'O "matcher" do SKILL.md tem "probe_keywords" inválido — use uma lista de palavras não vazias (até 50).';
+  }
+  if (campo === 'any_tags') {
+    return 'O "matcher" do SKILL.md tem "any_tags" inválido — use uma lista de etiquetas não vazias (até 20, com até 40 caracteres cada).';
+  }
+  return 'O "matcher" do SKILL.md está inválido — os campos são any_keywords, probe_keywords e any_tags, cada um como lista de textos não vazios.';
+}
+
+/**
+ * Raiz do pacote: `''` para o zip que já traz o SKILL.md na raiz, ou o
+ * diretório de topo que embrulha a skill (`humanizer-main/`). Devolve a lista
+ * de candidatos quando há mais de um — ambiguidade não se adivinha.
+ */
+function raizDoPacote(entryNames: string[]): { prefixo: string } | { candidatos: string[] } {
+  if (entryNames.includes('SKILL.md')) return { prefixo: '' };
+  const candidatos = entryNames.flatMap((p) => {
+    const m = /^([^/]+)\/SKILL\.md$/.exec(p);
+    return m === null ? [] : [m[1] as string];
+  });
+  if (candidatos.length === 1) return { prefixo: `${candidatos[0]}/` };
+  return { candidatos };
+}
+
+export function parseSkillPackage(zipBytes: Uint8Array): ParseSkillResult {
+  // Guard contra zip-bomb: fflate expõe o tamanho DECLARADO (do header local do zip) a este
+  // filtro ANTES de inflar cada entrada — recusamos aqui, sem nunca descomprimir o conteúdo
+  // malicioso na memória. Resíduo: um header mentiroso (originalSize menor que o real) ainda
+  // passaria por este filtro — por isso os checks de byteLength pós-unzip abaixo permanecem
+  // como defesa em profundidade.
+  let oversize: { code: 'skill_file_too_large' | 'skill_package_too_large'; message: string } | undefined;
+  let declaredTotal = 0;
+  let unzipped: Record<string, Uint8Array>;
+  try {
+    unzipped = unzipSync(zipBytes, {
+      filter: (f) => {
+        if (oversize !== undefined) return false; // já recusado, não gasta CPU inflando o resto
+        if (f.originalSize > MAX_FILE_BYTES) {
+          oversize = {
+            code: 'skill_file_too_large',
+            message: `O arquivo "${f.name}" tem mais de ${MAX_FILE_BYTES / 1024 / 1024}MB.`,
+          };
+          return false;
+        }
+        declaredTotal += f.originalSize;
+        if (declaredTotal > MAX_TOTAL_BYTES) {
+          oversize = {
+            code: 'skill_package_too_large',
+            message: `O pacote descompactado passa de ${MAX_TOTAL_BYTES / 1024 / 1024}MB.`,
+          };
+          return false;
+        }
+        return true;
+      },
+    });
+  } catch {
+    return fail('skill_zip_invalid', 'Não consegui abrir o arquivo .zip — verifique se o pacote não está corrompido.');
+  }
+  // O filtro acima descarta entradas silenciosamente — não podemos seguir como se o
+  // arquivo parcial resultante fosse o pacote completo.
+  if (oversize !== undefined) return fail(oversize.code, oversize.message);
+
+  const entryNames = Object.keys(unzipped).filter((p) => !p.endsWith('/'));
+
+  if (entryNames.length > MAX_FILES) {
+    return fail('skill_too_many_files', `O pacote tem ${entryNames.length} arquivos — o limite é ${MAX_FILES}.`);
+  }
+
+  for (const p of entryNames) {
+    if (!isSafePath(p)) {
+      return fail('skill_unsafe_path', `Caminho não permitido no pacote: "${p}" (sem "..", sem caminho absoluto).`);
+    }
+    const recusadoPeloStorage = p.split('/').find((segmento) => !segmentoCabeNoStorage(segmento));
+    if (recusadoPeloStorage !== undefined) {
+      return fail(
+        'skill_storage_name_invalid',
+        `O nome "${recusadoPeloStorage}" tem caractere que o Storage recusa em nome de arquivo — use letras sem acento, números, ponto, hífen, sublinhado ou espaço.`,
+      );
+    }
+  }
+
+  let totalBytes = 0;
+  for (const p of entryNames) {
+    const bytes = unzipped[p];
+    if (bytes === undefined) continue;
+    if (bytes.byteLength > MAX_FILE_BYTES) {
+      return fail('skill_file_too_large', `O arquivo "${p}" tem mais de ${MAX_FILE_BYTES / 1024 / 1024}MB.`);
+    }
+    totalBytes += bytes.byteLength;
+    if (totalBytes > MAX_TOTAL_BYTES) {
+      return fail('skill_package_too_large', `O pacote descompactado passa de ${MAX_TOTAL_BYTES / 1024 / 1024}MB.`);
+    }
+  }
+
+  // Um `.zip` baixado de repositório (o "Download ZIP" do GitHub) vem embrulhado
+  // num diretório de topo — `humanizer-main/SKILL.md`. O SKILL.md está na raiz
+  // DESSE diretório, não na raiz do zip. A raiz do pacote é o embrulho quando é
+  // o ÚNICO diretório de topo com SKILL.md; com dois candidatos, escolher um
+  // seria adivinhar — a recusa continua com o MESMO code, agora nomeando-os.
+  const raiz = raizDoPacote(entryNames);
+  if ('candidatos' in raiz) {
+    if (raiz.candidatos.length === 0) {
+      return fail('skill_md_missing', 'O pacote precisa de um arquivo SKILL.md na raiz.');
+    }
+    return fail(
+      'skill_md_missing',
+      `O pacote tem SKILL.md em mais de um diretório (${raiz.candidatos.join(', ')}) — não dá para escolher por você. Envie um .zip com um diretório só.`,
+    );
+  }
+  const prefixo = raiz.prefixo;
+  /** Caminho do arquivo DENTRO da skill (sem o diretório de embrulho), ou null se está fora dele. */
+  const caminhoDaSkill = (p: string): string | null =>
+    prefixo === '' ? p : p.startsWith(prefixo) ? p.slice(prefixo.length) : null;
+
+  const skillMdBytes = unzipped[`${prefixo}SKILL.md`];
+  if (skillMdBytes === undefined) {
+    return fail('skill_md_missing', 'O pacote precisa de um arquivo SKILL.md na raiz.');
+  }
+
+  const skillMdRaw = new TextDecoder('utf-8').decode(skillMdBytes);
+  const fmMatch = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(skillMdRaw);
+  if (!fmMatch) {
+    return fail('skill_frontmatter_invalid', 'SKILL.md precisa começar com um frontmatter delimitado por "---".');
+  }
+  const [, frontmatterRaw, bodyRaw] = fmMatch;
+  const { name, description, matcher, chavesDeMatcherDesconhecidas, matcherEmLinha } = parseFrontmatter(
+    frontmatterRaw ?? '',
+  );
+
+  if (name === undefined || name === '') {
+    return fail('skill_frontmatter_invalid', 'SKILL.md precisa de um campo "name" no frontmatter.');
+  }
+  if (!segmentoCabeNoStorage(name)) {
+    return fail(
+      'skill_storage_name_invalid',
+      `O nome da skill ("${name}") tem caractere que o Storage recusa em nome de arquivo — use letras sem acento, números, ponto, hífen, sublinhado ou espaço.`,
+    );
+  }
+  if (description === undefined || description === '') {
+    return fail('skill_frontmatter_invalid', 'SKILL.md precisa de um campo "description" no frontmatter.');
+  }
+  if (matcherEmLinha) {
+    return fail(
+      'skill_frontmatter_invalid',
+      'O "matcher" do SKILL.md precisa vir em bloco, uma chave por linha (ex.: "matcher:" e abaixo "  any_keywords: [frete, entrega]"); a forma em linha "matcher: { ... }" não é lida.',
+    );
+  }
+  // Typo dentro do matcher (`any_tag`) não vira "sem matcher": recusa nomeando a chave.
+  const chaveDesconhecida = chavesDeMatcherDesconhecidas[0];
+  if (chaveDesconhecida !== undefined) {
+    return fail(
+      'skill_frontmatter_invalid',
+      `O "matcher" do SKILL.md tem campo desconhecido ("${chaveDesconhecida}") — os campos são any_keywords, probe_keywords e any_tags.`,
+    );
+  }
+  // Matcher AUSENTE é legítimo (#4458): skill do ecossistema publica só name/description.
+  // `{}` significa "sem ativação automática" — o corpo entra pelo roteiro, que puxa pelo
+  // nome. O que não passa é matcher presente com a FORMA errada (item vazio, lista vazia,
+  // tipo errado): a mensagem nomeia o campo.
+  const matcherResult = skillMatcherSchema.safeParse(matcher);
+  if (!matcherResult.success) {
+    const campo = matcherResult.error.issues[0]?.path.join('.') ?? '';
+    return fail('skill_frontmatter_invalid', mensagemDoMatcherInvalido(campo));
+  }
+
+  const body = (bodyRaw ?? '').trim();
+  try {
+    validateSkillBody(body);
+  } catch (e) {
+    return fail('skill_frontmatter_invalid', e instanceof Error ? e.message : 'corpo de skill inválido');
+  }
+
+  const files: Array<{ path: string; bytes: Uint8Array; entry: SkillManifestEntry }> = [];
+  for (const p of entryNames) {
+    const caminho = caminhoDaSkill(p);
+    // Num pacote embrulhado, o que ficou FORA da pasta da skill é mobília do
+    // repositório (README, LICENSE, .github/…) e não é conteúdo da skill.
+    if (caminho === null) continue;
+    if (caminho === 'SKILL.md') continue;
+    const bytes = unzipped[p];
+    if (bytes === undefined) continue;
+
+    let kind: 'reference' | 'asset';
+    if (caminho.startsWith('references/')) {
+      kind = 'reference';
+    } else if (caminho.startsWith('assets/')) {
+      const ext = extensionOf(caminho);
+      if (!ASSET_EXTENSIONS.has(ext)) {
+        return fail('skill_asset_extension_invalid', `Extensão não permitida em "${caminho}" — use: ${[...ASSET_EXTENSIONS].join(', ')}.`);
+      }
+      kind = 'asset';
+    } else if (prefixo !== '') {
+      // Dentro do embrulho, README/LICENSE/scripts/… são do repositório: ficam
+      // de fora do manifest em vez de recusar o pacote — o "Download ZIP" do
+      // GitHub sempre os traz. references/ e assets/ acima seguem estritos.
+      continue;
+    } else {
+      return fail(
+        'skill_unexpected_path',
+        `Arquivo fora do esperado: "${caminho}" — o pacote só aceita SKILL.md, references/ e assets/.`,
+      );
+    }
+
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    files.push({ path: caminho, bytes, entry: { path: caminho, size: bytes.byteLength, sha256, kind } });
+  }
+
+  return {
+    ok: true,
+    pkg: { name, description, matcher: matcherResult.data, body, files },
+  };
+}
